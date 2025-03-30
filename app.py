@@ -9,13 +9,16 @@ from datetime import datetime
 DB_FILE = "groups.db"
 
 # GitHub repository details
-GITHUB_REPO = "sairajdream/group5"  # Replace with your GitHub username and repository name
+GITHUB_REPO = "sairajdream/group_creation"  # Replace with your GitHub username and repository name
 GITHUB_FILE_PATH = "groups.db"  # Path to the database file in the repository
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
 
 # Get GitHub token from environment variable
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
+if not GITHUB_TOKEN:
+    st.error("GitHub token not found. Please set it as an environment variable or in Streamlit Secrets.")
 
 # Check if the database file exists locally
 if not os.path.exists(DB_FILE):
@@ -89,7 +92,7 @@ def display_dashboard():
             </div>
             """, unsafe_allow_html=True)
 
-    st.header("Partial Groups (2-4 Members)")
+    st.header("Partial Groups (2-3 Members)")
     partial_groups = get_partial_groups()
     if partial_groups:
         for group in partial_groups:
@@ -123,6 +126,123 @@ def handle_group_operations():
         register_individual_option()
     elif option == "Switch Group":
         switch_group_option()
+
+def form_new_group():
+    st.subheader("Form New Group")
+    student_id = st.text_input("Your Student ID")
+
+    if not student_id:
+        st.error("Please enter your Student ID to proceed.")
+        return
+
+    if check_existing_group(student_id):
+        st.warning("You're already in a group. Use 'Manage My Group' to perform group operations.")
+        return
+
+    prompt = "Enter member details (name and Student ID separated by a comma, one member per line)"
+    member_input = st.text_area(prompt, height=150, help="e.g.\nSai Raj Ali, M01044027\nRukky, M01044253\nAmir, M01043484")
+
+    if st.button("Create Group"):
+        members_list = parse_members(member_input)
+        if members_list is None:
+            st.error("Please enter valid member details in the correct format.")
+            return
+        if not 2 <= len(members_list) <= 4:
+            st.error("Please enter between 2-4 members.")
+            return
+
+        creator_present = any(student_id in extract_student_id(member) for member in members_list)
+        if not creator_present:
+            st.error("Your Student ID must be included in the group members.")
+            return
+
+        conflicting_members = []
+        for member in members_list:
+            member_id = extract_student_id(member)
+            if check_existing_group(member_id):
+                conflicting_members.append(extract_name(member))
+            elif check_existing_individual(member_id):
+                conflicting_members.append(extract_name(member) + f" ({member_id})")
+
+        if conflicting_members:
+            st.error(f"The following members are already in a group or registered as individuals: {', '.join(conflicting_members)}")
+            return
+
+        vacancies = 4 - len(members_list)
+        create_group(members_list, vacancies)
+        for member in members_list:
+            member_id = extract_student_id(member)
+            remove_individual(member_id)
+        st.success(f"Group created successfully with {len(members_list)} members. {vacancies} spot(s) left!")
+
+def manage_my_group():
+    st.subheader("Manage My Group")
+    student_id = st.text_input("Enter your Student ID to manage your group:")
+    if st.button("View My Group"):
+        group = check_existing_group(student_id)
+        if group:
+            st.write(f"Your group details: {group}")
+        else:
+            st.warning("You are not part of any group.")
+
+def register_individual_option():
+    st.subheader("Register as Individual")
+    name = st.text_input("Your Name")
+    student_id = st.text_input("Your Student ID")
+    email = st.text_input("Your Email")
+
+    if st.button("Register"):
+        if not name or not student_id or not email:
+            st.error("All fields are required.")
+            return
+
+        if check_existing_group(student_id):
+            st.warning("You are already part of a group.")
+            return
+
+        if check_existing_individual(student_id):
+            st.warning("You are already registered as an individual.")
+            return
+
+        c.execute("INSERT INTO individuals (name, student_id, email, created_at) VALUES (?, ?, ?, ?)",
+                  (name, student_id, email, datetime.now()))
+        conn.commit()
+        st.success("You have been registered as an individual looking for a group.")
+
+def switch_group_option():
+    st.subheader("Switch Group")
+    student_id = st.text_input("Enter your Student ID to switch groups:")
+    if st.button("Switch Group"):
+        if not check_existing_group(student_id):
+            st.warning("You are not part of any group.")
+            return
+
+        c.execute("DELETE FROM groups WHERE members LIKE ?", (f"%({student_id})%",))
+        conn.commit()
+        st.success("You have been removed from your group. You can now join or create a new group.")
+
+def search_functionality():
+    st.subheader("Search Members or Groups")
+    search_query = st.text_input("Enter a name or Student ID to search:")
+    if st.button("Search"):
+        c.execute("SELECT * FROM groups WHERE members LIKE ?", (f"%{search_query}%",))
+        groups = c.fetchall()
+        if groups:
+            st.write("Groups found:")
+            for group in groups:
+                st.write(group)
+        else:
+            st.warning("No groups found with the given query.")
+
+def admin_view():
+    st.subheader("Admin View")
+    st.write("This section is for admin users to manage the database.")
+    if st.button("View All Groups"):
+        groups = get_all_groups()
+        st.write(groups)
+    if st.button("View All Individuals"):
+        individuals = get_all_individuals()
+        st.write(individuals)
 
 def export_data():
     st.subheader("Export Data to CSV")
@@ -163,43 +283,61 @@ def export_data():
             mime="application/octet-stream"
         )
 
-def upload_to_github():
-    """Upload the updated database to GitHub."""
-    try:
-        with open(DB_FILE, "rb") as f:
-            content = f.read()
-
-        # Get the SHA of the existing file
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-        response = requests.get(GITHUB_API_URL, headers=headers)
-        sha = response.json().get("sha")
-
-        # Upload the file
-        data = {
-            "message": "Update database",
-            "content": content.encode("base64").decode("utf-8"),
-            "sha": sha
-        }
-        response = requests.put(GITHUB_API_URL, json=data, headers=headers)
-        if response.status_code == 200:
-            st.success("Database uploaded to GitHub successfully.")
-        else:
-            st.error("Failed to upload database to GitHub.")
-    except Exception as e:
-        st.error(f"Error uploading database: {e}")
-
 # Helper functions
 def get_all_groups():
     c.execute("SELECT * FROM groups")
     return c.fetchall()
 
 def get_partial_groups():
-    c.execute("SELECT * FROM groups WHERE vacancies > 0 AND vacancies < 5")
+    c.execute("SELECT * FROM groups WHERE vacancies > 0 AND vacancies < 4")
     return c.fetchall()
 
 def get_all_individuals():
     c.execute("SELECT * FROM individuals")
     return c.fetchall()
+
+def check_existing_group(student_id):
+    c.execute("SELECT * FROM groups WHERE members LIKE ?", (f"%({student_id})%",))
+    return c.fetchone()
+
+def check_existing_individual(student_id):
+    c.execute("SELECT * FROM individuals WHERE student_id=?", (student_id,))
+    return c.fetchone()
+
+def create_group(members, vacancies):
+    c.execute("INSERT INTO groups (members, vacancies, created_at) VALUES (?, ?, ?)",
+              (str(members), vacancies, datetime.now()))
+    conn.commit()
+
+def remove_individual(student_id):
+    c.execute("DELETE FROM individuals WHERE student_id=?", (student_id,))
+    conn.commit()
+
+def parse_members(member_input):
+    members = []
+    lines = member_input.strip().split('\n')
+    for line in lines:
+        parts = line.split(',')
+        if len(parts) != 2:
+            return None
+        name = parts[0].strip()
+        student_id = parts[1].strip()
+        if not name or not student_id:
+            return None
+        members.append(f"{name} ({student_id})")
+    return members
+
+def extract_student_id(member_str):
+    try:
+        return member_str.split('(')[1].strip(')')
+    except IndexError:
+        return ""
+
+def extract_name(member_str):
+    try:
+        return member_str.split('(')[0].strip()
+    except IndexError:
+        return ""
 
 if __name__ == "__main__":
     main()
